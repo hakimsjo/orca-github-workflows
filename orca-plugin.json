@@ -1,0 +1,83 @@
+{
+  "manifestVersion": 2,
+  "id": "github-workflows",
+  "name": "GitHub Workflows",
+  "version": "0.1.0",
+  "description": "Visar aktiva och misslyckade GitHub Actions-workflows för öppna repon i Orca.",
+  "icon": "assets/icon.png",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "workflows",
+        "title": "GitHub Workflows",
+        "icon": "layers",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "workflows-status",
+        "text": "Workflows",
+        "icon": "layers",
+        "tone": "neutral",
+        "tooltip": "GitHub Actions-workflows för öppna repon"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.created"
+      },
+      {
+        "on": "workspace.removed"
+      },
+      {
+        "on": "workspace.changed"
+      }
+    ],
+    "settings": [
+      {
+        "key": "pollIntervalSeconds",
+        "title": "Uppdateringsintervall (sekunder)",
+        "description": "Hur ofta workflows hämtas när inga körningar är aktiva. När något körs pollas var 15:e sekund.",
+        "type": "integer",
+        "default": 60,
+        "minimum": 15,
+        "maximum": 600
+      },
+      {
+        "key": "runsPerRepo",
+        "title": "Körningar per repo",
+        "description": "Antal senaste workflow-körningar som hämtas per öppet repo.",
+        "type": "integer",
+        "default": 10,
+        "minimum": 3,
+        "maximum": 25
+      },
+      {
+        "key": "includeHiddenProjects",
+        "title": "Inkludera dolda projekt",
+        "description": "Visa även Git-repon som är markerade som dolda i Orcas sidofält.",
+        "type": "boolean",
+        "default": false
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ]
+}
