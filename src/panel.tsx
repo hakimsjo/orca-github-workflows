@@ -41,6 +41,7 @@ const jobsErrorByRunAtom = atom<Record<number, string>>({})
 const actionBusyRunIdAtom = atom<number | null>(null)
 const actionErrorAtom = atom<string | null>(null)
 
+let lastWorkerId: string | null = null
 let lastSequence = -1
 let refreshSafetyTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -67,6 +68,10 @@ function setRefreshingSafe(next: boolean): void {
 }
 
 function applySnapshotResponse(res: SnapshotResponse): void {
+  if (res.workerId && res.workerId !== lastWorkerId) {
+    lastWorkerId = res.workerId
+    lastSequence = -1
+  }
   const seq = typeof res.sequence === 'number' ? res.sequence : -1
   if (seq >= 0 && seq < lastSequence) {
     return
@@ -130,8 +135,11 @@ async function handleRefresh(): Promise<void> {
     const res = await plugin.request('workflows.refresh', undefined, { timeoutMs: 35_000 })
     applySnapshotResponse(res)
   } catch (err) {
-    setRefreshingSafe(false)
     set(actionErrorAtom, err instanceof Error ? err.message : 'Kunde inte uppdatera workflows.')
+  } finally {
+    if (read(refreshingAtom)) {
+      setRefreshingSafe(false)
+    }
   }
 }
 
@@ -221,6 +229,7 @@ function handleFilterByRepo(repoFullName: string): void {
 }
 
 export function setup(ctx: PanelContext): () => void {
+  lastWorkerId = null
   lastSequence = -1
   let receivedUpdateEvent = false
 

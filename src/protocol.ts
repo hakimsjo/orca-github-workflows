@@ -82,8 +82,9 @@ export interface WorkflowJob {
 }
 
 export interface SnapshotResponse {
-  snapshot: WorkflowSnapshot | null
+  snapshot?: WorkflowSnapshot | null
   refreshing: boolean
+  workerId?: string
   sequence?: number
   error?: string | null
 }

@@ -114,13 +114,16 @@ export function normalizeWorkflowRun(
   const updatedAt = raw.updated_at ?? createdAt
   const runStartedAtMs = raw.run_started_at ? parseTimestampMs(raw.run_started_at) || null : null
 
+  const rawTitle = raw.display_title?.trim() || raw.name?.trim() || `Körning #${raw.run_number ?? raw.id}`
+  const displayTitle = rawTitle.length > 140 ? `${rawTitle.slice(0, 137)}...` : rawTitle
+
   return {
     id: raw.id,
     repoFullName: repo.repoFullName,
     projectName: repo.projectName,
     projectId: repo.projectId,
     name: raw.name?.trim() || 'Workflow',
-    displayTitle: raw.display_title?.trim() || raw.name?.trim() || `Körning #${raw.run_number ?? raw.id}`,
+    displayTitle,
     runNumber: raw.run_number ?? 0,
     runAttempt: raw.run_attempt ?? 1,
     status,

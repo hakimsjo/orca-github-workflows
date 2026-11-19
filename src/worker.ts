@@ -268,6 +268,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   let lastSnapshot: WorkflowSnapshot | null = null
   let lastError: string | null = null
   let sequence = 0
+  const workerId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
   function nextSeq(): number {
     sequence += 1
@@ -432,8 +433,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     const task = (async () => {
       const cached = lastSnapshot ?? (await readCachedSnapshot(orca))
       safePostUpdate({
-        snapshot: cached,
         refreshing: true,
+        workerId,
         sequence: nextSeq(),
         error: null
       })
@@ -454,6 +455,7 @@ export default function activate(orca: OrcaWorkerApi): void {
         safePostUpdate({
           snapshot,
           refreshing: false,
+          workerId,
           sequence: nextSeq(),
           error: null
         })
@@ -476,6 +478,7 @@ export default function activate(orca: OrcaWorkerApi): void {
         safePostUpdate({
           snapshot: fallback,
           refreshing: false,
+          workerId,
           sequence: nextSeq(),
           error: message
         })
@@ -500,6 +503,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     return {
       snapshot: cached,
       refreshing: Boolean(inFlightRefresh),
+      workerId,
       sequence,
       error: lastError
     }
@@ -510,6 +514,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     return {
       snapshot,
       refreshing: false,
+      workerId,
       sequence,
       error
     }
@@ -594,6 +599,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       safePostUpdate({
         snapshot: lastSnapshot,
         refreshing: Boolean(inFlightRefresh),
+        workerId,
         sequence: nextSeq(),
         error: lastError
       })

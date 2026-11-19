@@ -166,3 +166,26 @@ test('panel recovers cleanly when workflows.get fails instead of hanging', async
   assert.deepEqual(view.refusals, [])
   await view.unmount()
 })
+
+test('panel accepts lower sequence numbers after workerId changes (worker restart)', async () => {
+  const snapshot = createSampleSnapshot({ includeActiveAndFailed: false })
+  const host = mockHost({
+    requests: {
+      'workflows.get': () => ({ snapshot, refreshing: false, workerId: 'worker-1', sequence: 20 }),
+      'workflows.refresh': () => ({ snapshot, refreshing: false, workerId: 'worker-2', sequence: 1 })
+    }
+  })
+
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ label: 'Inga aktiva workflows' }))
+
+  // Refresh after worker restarted with sequence=1 (< 20): must not hang or stay refreshing
+  const refreshBtn = view.find({ type: 'IconButton', label: 'Uppdatera' })
+  assert.ok(refreshBtn)
+  await view.press(refreshBtn)
+
+  assert.equal(view.find({ type: 'Spinner' }), null)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.refusals, [])
+  await view.unmount()
+})
