@@ -190,17 +190,34 @@ test('panel accepts lower sequence numbers after workerId changes (worker restar
   await view.unmount()
 })
 
-test('panel filters repos and runs by selected organization', async () => {
+test('panel switches organization via workflows.selectOrg even with 0 open repos', async () => {
   const now = Date.now()
-  const snapshot = buildWorkflowSnapshot({
+  const orgs = [
+    { id: 'open', label: 'Öppna repon i Orca', kind: 'open' as const },
+    { id: 'hakimsjo', label: 'hakimsjo (Personligt)', kind: 'personal' as const },
+    { id: 'systembydesign', label: 'Org: systembydesign', kind: 'organization' as const }
+  ]
+
+  const emptyOpenSnapshot = buildWorkflowSnapshot({
+    repoInputs: [],
+    focusedProjectId: null,
+    focusedBranch: null,
+    selectedOrgId: 'open',
+    availableOrgs: orgs,
+    authStatus: 'ok',
+    authError: null,
+    fetchedAt: now
+  })
+
+  const orgSnapshot = buildWorkflowSnapshot({
     repoInputs: [
       {
-        projectId: 'p1',
+        projectId: 'gh:systembydesign/qvitta',
         projectName: 'qvitta',
         repoFullName: 'systembydesign/qvitta',
-        path: '/repos/qvitta',
-        openBranches: ['main'],
-        isFocused: true,
+        path: '',
+        openBranches: [],
+        isFocused: false,
         error: null,
         rawRuns: [
           {
@@ -214,31 +231,12 @@ test('panel filters repos and runs by selected organization', async () => {
             updated_at: new Date(now - 10_000).toISOString()
           }
         ]
-      },
-      {
-        projectId: 'p2',
-        projectName: 'orca-github-workflows',
-        repoFullName: 'hakimsjo/orca-github-workflows',
-        path: '/repos/orca-github-workflows',
-        openBranches: ['main'],
-        isFocused: false,
-        error: null,
-        rawRuns: [
-          {
-            id: 202,
-            name: 'Check',
-            run_number: 4,
-            status: 'in_progress',
-            conclusion: null,
-            head_branch: 'main',
-            created_at: new Date(now - 25_000).toISOString(),
-            updated_at: new Date(now - 15_000).toISOString()
-          }
-        ]
       }
     ],
-    focusedProjectId: 'p1',
-    focusedBranch: 'main',
+    focusedProjectId: null,
+    focusedBranch: null,
+    selectedOrgId: 'systembydesign',
+    availableOrgs: orgs,
     authStatus: 'ok',
     authError: null,
     fetchedAt: now
@@ -246,21 +244,23 @@ test('panel filters repos and runs by selected organization', async () => {
 
   const host = mockHost({
     requests: {
-      'workflows.get': () => ({ snapshot, refreshing: false })
+      'workflows.get': () => ({ snapshot: emptyOpenSnapshot, refreshing: false }),
+      'workflows.selectOrg': (input: { orgId: string }) => ({
+        snapshot: input.orgId === 'systembydesign' ? orgSnapshot : emptyOpenSnapshot,
+        refreshing: false
+      })
     }
   })
 
   const view = await mount(panel, { host })
-  assert.ok(view.find({ text: 'CI #10' }))
-  assert.ok(view.find({ text: 'Check #4' }))
+  assert.ok(view.find({ text: '0 öppna repon i Orca' }))
 
   const orgSelect = view.find({ type: 'Select', label: 'Organisation' })
   assert.ok(orgSelect)
-  await view.select(orgSelect, 'hakimsjo')
+  await view.select(orgSelect, 'systembydesign')
 
-  assert.equal(view.find({ text: 'CI #10' }), null)
-  assert.ok(view.find({ text: 'Check #4' }))
-  assert.ok(view.find({ text: '1 öppna repon i Orca' }))
+  assert.ok(view.find({ text: 'CI #10' }))
+  assert.ok(view.find({ text: '1 repon i systembydesign' }))
 
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.refusals, [])

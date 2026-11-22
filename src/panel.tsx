@@ -25,13 +25,12 @@ import {
   type PanelContext,
   type Tone
 } from 'orca'
-import { extractAvailableOwners, filterSnapshotByOwner } from './github'
-import type { RepoSummary, SnapshotResponse, WorkflowJob, WorkflowRun, WorkflowSnapshot, WorkflowStatusCategory } from './protocol'
+import type { RepoSummary, SnapshotResponse, WorkflowJob, WorkflowOrgOption, WorkflowRun, WorkflowSnapshot, WorkflowStatusCategory } from './protocol'
 
 const snapshotAtom = atom<WorkflowSnapshot | null>(null)
 const refreshingAtom = atom<boolean>(false)
 const activeTabAtom = atom<'active' | 'failed' | 'all' | 'repos'>('active', 'active', { persist: 'plugin' })
-const selectedOrgAtom = atom<string>('orgFilter', 'all', { persist: 'plugin' })
+const selectedOrgAtom = atom<string>('open')
 const selectedRepoAtom = atom<string>('repoFilter', 'all', { persist: 'plugin' })
 const statusFilterAtom = atom<string>('statusFilter', 'all', { persist: 'plugin' })
 const onlyOpenBranchesAtom = atom<boolean>('onlyOpenBranches', false, { persist: 'plugin' })
@@ -83,6 +82,9 @@ function applySnapshotResponse(res: SnapshotResponse): void {
   }
   if (res.snapshot !== undefined) {
     set(snapshotAtom, res.snapshot)
+    if (res.snapshot?.selectedOrgId) {
+      set(selectedOrgAtom, res.snapshot.selectedOrgId)
+    }
   }
   setRefreshingSafe(Boolean(res.refreshing))
   if (res.error) {
@@ -134,7 +136,8 @@ async function handleRefresh(): Promise<void> {
   setRefreshingSafe(true)
   set(actionErrorAtom, null)
   try {
-    const res = await plugin.request('workflows.refresh', undefined, { timeoutMs: 35_000 })
+    const orgId = read(snapshotAtom)?.selectedOrgId ?? read(selectedOrgAtom)
+    const res = await plugin.request('workflows.refresh', { orgId }, { timeoutMs: 35_000 })
     applySnapshotResponse(res)
   } catch (err) {
     set(actionErrorAtom, err instanceof Error ? err.message : 'Kunde inte uppdatera workflows.')
@@ -142,6 +145,20 @@ async function handleRefresh(): Promise<void> {
     if (read(refreshingAtom)) {
       setRefreshingSafe(false)
     }
+  }
+}
+
+async function handleSelectOrg(orgId: string): Promise<void> {
+  set(selectedOrgAtom, orgId)
+  set(selectedRepoAtom, 'all')
+  set(actionErrorAtom, null)
+  setRefreshingSafe(true)
+  try {
+    const res = await plugin.request('workflows.selectOrg', { orgId }, { timeoutMs: 35_000 })
+    applySnapshotResponse(res)
+  } catch (err) {
+    setRefreshingSafe(false)
+    set(actionErrorAtom, err instanceof Error ? err.message : 'Kunde inte byta organisation.')
   }
 }
 
@@ -299,7 +316,11 @@ function HeaderBar({ snapshot, refreshing }: { snapshot: WorkflowSnapshot | null
           ) : null}
         </Row>
         <Text muted size="xs">
-          {snapshot ? `${snapshot.counts.repos} öppna repon i Orca` : 'Läser öppna repon...'}
+          {snapshot
+            ? snapshot.selectedOrgId === 'open'
+              ? `${snapshot.counts.repos} öppna repon i Orca`
+              : `${snapshot.counts.repos} repon i ${snapshot.selectedOrgId}`
+            : 'Läser repon...'}
         </Text>
       </Stack>
       <Row gap="xs" align="center">
@@ -319,27 +340,21 @@ function HeaderBar({ snapshot, refreshing }: { snapshot: WorkflowSnapshot | null
 }
 
 function OrgSelector({
-  owners,
-  selectedOrg
+  orgs,
+  selectedOrgId
 }: {
-  owners: string[]
-  selectedOrg: string
+  orgs: WorkflowOrgOption[]
+  selectedOrgId: string
 }) {
-  if (owners.length === 0) return null
+  if (orgs.length <= 1) return null
 
   return (
     <Select
       label="Organisation"
       labelHidden
-      value={selectedOrg}
-      options={[
-        { value: 'all', label: 'Alla organisationer' },
-        ...owners.map((owner) => ({ value: owner, label: owner }))
-      ]}
-      onChange={(val) => {
-        set(selectedOrgAtom, val)
-        set(selectedRepoAtom, 'all')
-      }}
+      value={selectedOrgId}
+      options={orgs.map((org) => ({ value: org.id, label: org.label }))}
+      onChange={handleSelectOrg}
     />
   )
 }
@@ -726,20 +741,17 @@ function ReposTab({ snapshot }: { snapshot: WorkflowSnapshot }) {
 }
 
 export default function Panel() {
-  const rawSnapshot = read(snapshotAtom)
+  const snapshot = read(snapshotAtom)
   const refreshing = read(refreshingAtom)
   const activeTab = read(activeTabAtom)
   const actionError = read(actionErrorAtom)
-  const owners = rawSnapshot ? extractAvailableOwners(rawSnapshot.repos) : []
-  const storedOrg = read(selectedOrgAtom)
-  const selectedOrg =
-    storedOrg !== 'all' && owners.some((owner) => owner.toLowerCase() === storedOrg.toLowerCase()) ? storedOrg : 'all'
-  const snapshot = rawSnapshot ? filterSnapshotByOwner(rawSnapshot, selectedOrg) : null
+  const selectedOrgId = snapshot?.selectedOrgId ?? read(selectedOrgAtom)
+  const availableOrgs = snapshot?.availableOrgs ?? []
 
   return (
     <Stack gap="md">
       <HeaderBar snapshot={snapshot} refreshing={refreshing} />
-      <OrgSelector owners={owners} selectedOrg={selectedOrg} />
+      <OrgSelector orgs={availableOrgs} selectedOrgId={selectedOrgId} />
 
       {actionError ? (
         <Callout tone="warning" icon="warning" title="Kunde inte hämta alla uppgifter">

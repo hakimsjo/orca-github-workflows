@@ -2,6 +2,7 @@ import type {
   RepoSummary,
   WorkflowJob,
   WorkflowJobStep,
+  WorkflowOrgOption,
   WorkflowRun,
   WorkflowSnapshot,
   WorkflowStatusCategory
@@ -191,6 +192,8 @@ export function buildWorkflowSnapshot(params: {
   }[]
   focusedProjectId: string | null
   focusedBranch: string | null
+  selectedOrgId?: string
+  availableOrgs?: WorkflowOrgOption[]
   authStatus: 'ok' | 'unauthenticated' | 'missing_gh'
   authError: string | null
   fetchedAt?: number
@@ -270,6 +273,8 @@ export function buildWorkflowSnapshot(params: {
     runs: allRuns,
     focusedProjectId: params.focusedProjectId,
     focusedBranch: params.focusedBranch,
+    selectedOrgId: params.selectedOrgId ?? 'open',
+    availableOrgs: params.availableOrgs ?? [{ id: 'open', label: 'Öppna repon i Orca', kind: 'open' }],
     authStatus: params.authStatus,
     authError: params.authError,
     fetchedAt: params.fetchedAt ?? Date.now(),
