@@ -25,11 +25,13 @@ import {
   type PanelContext,
   type Tone
 } from 'orca'
+import { extractAvailableOwners, filterSnapshotByOwner } from './github'
 import type { RepoSummary, SnapshotResponse, WorkflowJob, WorkflowRun, WorkflowSnapshot, WorkflowStatusCategory } from './protocol'
 
 const snapshotAtom = atom<WorkflowSnapshot | null>(null)
 const refreshingAtom = atom<boolean>(false)
 const activeTabAtom = atom<'active' | 'failed' | 'all' | 'repos'>('active', 'active', { persist: 'plugin' })
+const selectedOrgAtom = atom<string>('orgFilter', 'all', { persist: 'plugin' })
 const selectedRepoAtom = atom<string>('repoFilter', 'all', { persist: 'plugin' })
 const statusFilterAtom = atom<string>('statusFilter', 'all', { persist: 'plugin' })
 const onlyOpenBranchesAtom = atom<boolean>('onlyOpenBranches', false, { persist: 'plugin' })
@@ -316,6 +318,32 @@ function HeaderBar({ snapshot, refreshing }: { snapshot: WorkflowSnapshot | null
   )
 }
 
+function OrgSelector({
+  owners,
+  selectedOrg
+}: {
+  owners: string[]
+  selectedOrg: string
+}) {
+  if (owners.length === 0) return null
+
+  return (
+    <Select
+      label="Organisation"
+      labelHidden
+      value={selectedOrg}
+      options={[
+        { value: 'all', label: 'Alla organisationer' },
+        ...owners.map((owner) => ({ value: owner, label: owner }))
+      ]}
+      onChange={(val) => {
+        set(selectedOrgAtom, val)
+        set(selectedRepoAtom, 'all')
+      }}
+    />
+  )
+}
+
 function SummaryStrip({ snapshot }: { snapshot: WorkflowSnapshot }) {
   const { running, queued, currentFailing, repos } = snapshot.counts
   const activeCount = running + queued
@@ -557,7 +585,8 @@ function FailedRunsTab({ snapshot }: { snapshot: WorkflowSnapshot }) {
 }
 
 function AllRunsTab({ snapshot }: { snapshot: WorkflowSnapshot }) {
-  const selectedRepo = read(selectedRepoAtom)
+  const rawSelectedRepo = read(selectedRepoAtom)
+  const selectedRepo = snapshot.repos.some((r) => r.repoFullName === rawSelectedRepo) ? rawSelectedRepo : 'all'
   const statusFilter = read(statusFilterAtom)
   const onlyOpenBranches = read(onlyOpenBranchesAtom)
 
@@ -697,14 +726,20 @@ function ReposTab({ snapshot }: { snapshot: WorkflowSnapshot }) {
 }
 
 export default function Panel() {
-  const snapshot = read(snapshotAtom)
+  const rawSnapshot = read(snapshotAtom)
   const refreshing = read(refreshingAtom)
   const activeTab = read(activeTabAtom)
   const actionError = read(actionErrorAtom)
+  const owners = rawSnapshot ? extractAvailableOwners(rawSnapshot.repos) : []
+  const storedOrg = read(selectedOrgAtom)
+  const selectedOrg =
+    storedOrg !== 'all' && owners.some((owner) => owner.toLowerCase() === storedOrg.toLowerCase()) ? storedOrg : 'all'
+  const snapshot = rawSnapshot ? filterSnapshotByOwner(rawSnapshot, selectedOrg) : null
 
   return (
     <Stack gap="md">
       <HeaderBar snapshot={snapshot} refreshing={refreshing} />
+      <OrgSelector owners={owners} selectedOrg={selectedOrg} />
 
       {actionError ? (
         <Callout tone="warning" icon="warning" title="Kunde inte hämta alla uppgifter">

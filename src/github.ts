@@ -282,3 +282,41 @@ export function isActiveOrFailingRun(run: WorkflowRun): boolean {
   if (run.category === 'failed' && run.isLatestForKey) return true
   return false
 }
+
+export function extractRepoOwner(repoFullName: string): string {
+  const slash = repoFullName.indexOf('/')
+  return slash > 0 ? repoFullName.slice(0, slash) : repoFullName
+}
+
+export function extractAvailableOwners(repos: readonly RepoSummary[]): string[] {
+  const seen = new Map<string, string>()
+  for (const repo of repos) {
+    const owner = extractRepoOwner(repo.repoFullName)
+    const key = owner.toLowerCase()
+    if (!seen.has(key)) {
+      seen.set(key, owner)
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.localeCompare(b, 'sv'))
+}
+
+export function filterSnapshotByOwner(snapshot: WorkflowSnapshot, selectedOrg: string): WorkflowSnapshot {
+  if (!selectedOrg || selectedOrg === 'all') return snapshot
+  const target = selectedOrg.toLowerCase()
+  const repos = snapshot.repos.filter((r) => extractRepoOwner(r.repoFullName).toLowerCase() === target)
+  const runs = snapshot.runs.filter((r) => extractRepoOwner(r.repoFullName).toLowerCase() === target)
+
+  return {
+    ...snapshot,
+    repos,
+    runs,
+    counts: {
+      repos: repos.length,
+      running: runs.filter((r) => r.category === 'running').length,
+      queued: runs.filter((r) => r.category === 'queued').length,
+      failed: runs.filter((r) => r.category === 'failed').length,
+      currentFailing: runs.filter((r) => r.category === 'failed' && r.isLatestForKey).length,
+      success: runs.filter((r) => r.category === 'success').length
+    }
+  }
+}
