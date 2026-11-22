@@ -45,10 +45,10 @@
       {
         "key": "pollIntervalSeconds",
         "title": "Uppdateringsintervall (sekunder)",
-        "description": "Hur ofta workflows hämtas när inga körningar är aktiva. När något körs pollas var 15:e sekund.",
+        "description": "Hur ofta workflows hämtas när inga körningar är aktiva. När något körs pollas var 30:e sekund.",
         "type": "integer",
-        "default": 60,
-        "minimum": 15,
+        "default": 120,
+        "minimum": 30,
         "maximum": 600
       },
       {

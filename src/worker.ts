@@ -17,11 +17,14 @@ const execFileAsync = promisify(execFile)
 
 const SNAPSHOT_STORAGE_KEY = 'workflows:snapshot'
 const SELECTED_ORG_KEY = 'workflows:selectedOrg'
-const DEFAULT_POLL_INTERVAL_SECONDS = 60
-const ACTIVE_POLL_INTERVAL_SECONDS = 15
-const STALE_AFTER_MS = 20_000
+const DEFAULT_POLL_INTERVAL_SECONDS = 120
+const ACTIVE_POLL_INTERVAL_SECONDS = 30
+const RATE_LIMIT_BACKOFF_SECONDS = 300
+const STALE_AFTER_MS = 60_000
+const ORGS_CACHE_TTL_MS = 15 * 60 * 1000
+const ORG_REPOS_CACHE_TTL_MS = 5 * 60 * 1000
 const REPO_FETCH_CONCURRENCY = 5
-const ORG_REPOS_LIMIT = 20
+const ORG_REPOS_LIMIT = 10
 const REFRESH_HARD_TIMEOUT_MS = 25_000
 
 const REPO_NAME_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
@@ -56,7 +59,7 @@ async function readSettings(orca: OrcaWorkerApi): Promise<PluginSettings> {
   try {
     const raw = await orca.settings.get()
     return {
-      pollIntervalSeconds: clampInt(raw.pollIntervalSeconds, DEFAULT_POLL_INTERVAL_SECONDS, 15, 600),
+      pollIntervalSeconds: clampInt(raw.pollIntervalSeconds, DEFAULT_POLL_INTERVAL_SECONDS, 30, 600),
       runsPerRepo: clampInt(raw.runsPerRepo, 10, 3, 25),
       includeHiddenProjects: raw.includeHiddenProjects === true
     }
@@ -116,7 +119,10 @@ async function mapWithConcurrency<T, R>(
   return results
 }
 
-function classifyGhError(err: unknown): { kind: 'missing_gh' | 'unauthenticated' | 'timeout' | 'other'; message: string } {
+export function classifyGhError(err: unknown): {
+  kind: 'missing_gh' | 'unauthenticated' | 'rate_limited' | 'timeout' | 'other'
+  message: string
+} {
   const e = err as { code?: string | number; killed?: boolean; signal?: string; stderr?: string; message?: string }
   if (e.code === 'ENOENT') {
     return {
@@ -132,6 +138,12 @@ function classifyGhError(err: unknown): { kind: 'missing_gh' | 'unauthenticated'
   }
   const detail = `${e.stderr ?? ''}\n${e.message ?? ''}`.trim()
   const lower = detail.toLowerCase()
+  if (lower.includes('api rate limit exceeded') || lower.includes('secondary rate limit') || lower.includes('http 429')) {
+    return {
+      kind: 'rate_limited',
+      message: 'GitHub API-kvoten är tillfälligt slut. Pausar automatisk uppdatering i 5 minuter.'
+    }
+  }
   if (
     lower.includes('gh auth login') ||
     lower.includes('not logged into any github hosts') ||
@@ -278,7 +290,13 @@ async function fetchReposForOwner(
 async function fetchRunsForRepo(
   repoFullName: string,
   runsPerRepo: number
-): Promise<{ runs: RawWorkflowRun[]; error: string | null; authIssue?: 'missing_gh' | 'unauthenticated'; authMessage?: string }> {
+): Promise<{
+  runs: RawWorkflowRun[]
+  error: string | null
+  authIssue?: 'missing_gh' | 'unauthenticated'
+  authMessage?: string
+  rateLimited?: boolean
+}> {
   try {
     const { stdout } = await execFileAsync(
       GH_BIN,
@@ -307,7 +325,8 @@ async function fetchRunsForRepo(
     }
     return {
       runs: [],
-      error: classified.message
+      error: classified.message,
+      rateLimited: classified.kind === 'rate_limited'
     }
   }
 }
@@ -380,6 +399,46 @@ export default function activate(orca: OrcaWorkerApi): void {
   let lastError: string | null = null
   let sequence = 0
   const workerId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  let cachedOrgs: { orgs: WorkflowOrgOption[]; personalLogin: string | null; fetchedAt: number } | null = null
+  const cachedOrgRepos = new Map<string, { repos: { name: string; fullName: string }[]; fetchedAt: number }>()
+
+  async function getAvailableOrgsCached(): Promise<{
+    orgs: WorkflowOrgOption[]
+    personalLogin: string | null
+    authIssue?: 'missing_gh' | 'unauthenticated'
+    authMessage?: string
+    rateLimited?: boolean
+  }> {
+    if (cachedOrgs && Date.now() - cachedOrgs.fetchedAt < ORGS_CACHE_TTL_MS) {
+      return { orgs: cachedOrgs.orgs, personalLogin: cachedOrgs.personalLogin }
+    }
+    const res = await fetchAvailableOrgs()
+    if (!res.authIssue && res.orgs.length > 1) {
+      cachedOrgs = { orgs: res.orgs, personalLogin: res.personalLogin, fetchedAt: Date.now() }
+    }
+    return res
+  }
+
+  async function getReposForOwnerCached(
+    owner: string,
+    isPersonal: boolean
+  ): Promise<{
+    repos: { name: string; fullName: string }[]
+    authIssue?: 'missing_gh' | 'unauthenticated'
+    authMessage?: string
+    error?: string
+  }> {
+    const key = owner.toLowerCase()
+    const cached = cachedOrgRepos.get(key)
+    if (cached && Date.now() - cached.fetchedAt < ORG_REPOS_CACHE_TTL_MS) {
+      return { repos: cached.repos }
+    }
+    const res = await fetchReposForOwner(owner, isPersonal)
+    if (!res.authIssue && !res.error) {
+      cachedOrgRepos.set(key, { repos: res.repos, fetchedAt: Date.now() })
+    }
+    return res
+  }
 
   function nextSeq(): number {
     sequence += 1
@@ -405,16 +464,18 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
   }
 
-  async function scheduleNextPoll(snapshot: WorkflowSnapshot | null): Promise<void> {
+  async function scheduleNextPoll(snapshot: WorkflowSnapshot | null, rateLimited = false): Promise<void> {
     if (disposed) return
     if (pollTimer) clearTimeout(pollTimer)
     const settings = await readSettings(orca)
     if (disposed) return
 
     const hasActive = Boolean(snapshot && snapshot.counts.running + snapshot.counts.queued > 0)
-    const intervalSec = hasActive
-      ? Math.min(settings.pollIntervalSeconds, ACTIVE_POLL_INTERVAL_SECONDS)
-      : settings.pollIntervalSeconds
+    const intervalSec = rateLimited
+      ? RATE_LIMIT_BACKOFF_SECONDS
+      : hasActive
+        ? Math.min(settings.pollIntervalSeconds, ACTIVE_POLL_INTERVAL_SECONDS)
+        : settings.pollIntervalSeconds
 
     pollTimer = setTimeout(() => {
       void refreshSnapshot()
@@ -444,7 +505,7 @@ export default function activate(orca: OrcaWorkerApi): void {
         return { workspaces: [], truncated: false }
       }),
       orca.host.call('workspace.readContext').catch(() => null),
-      fetchAvailableOrgs()
+      getAvailableOrgsCached()
     ])
 
     const workspaces = workspacesRes.workspaces ?? []
@@ -526,7 +587,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       repoTargets = Array.from(dedupedByFullName.values())
     } else if (authStatus === 'ok') {
       const isPersonal = Boolean(orgDiscovery.personalLogin && selectedOrgId === orgDiscovery.personalLogin)
-      const orgRepos = await fetchReposForOwner(selectedOrgId, isPersonal)
+      const orgRepos = await getReposForOwnerCached(selectedOrgId, isPersonal)
       if (orgRepos.authIssue && authStatus === 'ok') {
         authStatus = orgRepos.authIssue
         authError = orgRepos.authMessage ?? null
@@ -546,8 +607,12 @@ export default function activate(orca: OrcaWorkerApi): void {
       })
     }
 
+    let rateLimited = false
     const fetchedRepos = await mapWithConcurrency(repoTargets, REPO_FETCH_CONCURRENCY, async (target) => {
       const fetched = await fetchRunsForRepo(target.repoFullName, settings.runsPerRepo)
+      if (fetched.rateLimited) {
+        rateLimited = true
+      }
       if (fetched.authIssue && authStatus === 'ok') {
         authStatus = fetched.authIssue
         authError = fetched.authMessage ?? fetched.error
@@ -563,6 +628,10 @@ export default function activate(orca: OrcaWorkerApi): void {
         error: fetched.authIssue ? null : fetched.error
       }
     })
+
+    if (rateLimited) {
+      throw new Error('GitHub API-kvoten är tillfälligt slut. Pausar automatisk uppdatering i 5 minuter.')
+    }
 
     return buildWorkflowSnapshot({
       repoInputs: fetchedRepos,
@@ -640,7 +709,9 @@ export default function activate(orca: OrcaWorkerApi): void {
             sequence: nextSeq(),
             error: message
           })
-          await scheduleNextPoll(fallback)
+          const isRateLimited =
+            message.includes('API-kvoten') || message.toLowerCase().includes('rate limit')
+          await scheduleNextPoll(fallback, isRateLimited)
         }
         return { snapshot: fallback, error: message }
       } finally {

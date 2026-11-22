@@ -831,7 +831,7 @@ export default function Panel() {
               Uppdaterad <RelativeTime at={snapshot.fetchedAt} format="short" muted />
             </Text>
             <Text muted size="xs">
-              {snapshot.counts.running + snapshot.counts.queued > 0 ? 'Pollar var 15:e sek' : 'Bakgrundspolling aktiv'}
+              {snapshot.counts.running + snapshot.counts.queued > 0 ? 'Pollar var 30:e sek' : 'Bakgrundspolling aktiv'}
             </Text>
           </Row>
         </>

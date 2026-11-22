@@ -258,3 +258,11 @@ test('worker keeps status bar neutral with label Workflows and summary tooltip',
 
   await worker.deactivate()
 })
+
+test('classifyGhError detects GitHub API rate limit errors', () => {
+  const res = main.classifyGhError({
+    stderr: 'gh: API rate limit exceeded for user ID 8287550 (HTTP 403)'
+  })
+  assert.equal(res.kind, 'rate_limited')
+  assert.match(res.message, /API-kvoten/)
+})
