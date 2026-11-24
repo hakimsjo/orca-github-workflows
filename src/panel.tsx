@@ -25,11 +25,12 @@ import {
   type PanelContext,
   type Tone
 } from 'orca'
-import type { RepoSummary, SnapshotResponse, WorkflowJob, WorkflowRun, WorkflowSnapshot, WorkflowStatusCategory } from './protocol'
+import type { RepoSummary, SnapshotResponse, WorkflowJob, WorkflowOrgOption, WorkflowRun, WorkflowSnapshot, WorkflowStatusCategory } from './protocol'
 
 const snapshotAtom = atom<WorkflowSnapshot | null>(null)
 const refreshingAtom = atom<boolean>(false)
 const activeTabAtom = atom<'active' | 'failed' | 'all' | 'repos'>('active', 'active', { persist: 'plugin' })
+const selectedOrgAtom = atom<string>('open')
 const selectedRepoAtom = atom<string>('repoFilter', 'all', { persist: 'plugin' })
 const statusFilterAtom = atom<string>('statusFilter', 'all', { persist: 'plugin' })
 const onlyOpenBranchesAtom = atom<boolean>('onlyOpenBranches', false, { persist: 'plugin' })
@@ -81,6 +82,9 @@ function applySnapshotResponse(res: SnapshotResponse): void {
   }
   if (res.snapshot !== undefined) {
     set(snapshotAtom, res.snapshot)
+    if (res.snapshot?.selectedOrgId) {
+      set(selectedOrgAtom, res.snapshot.selectedOrgId)
+    }
   }
   setRefreshingSafe(Boolean(res.refreshing))
   if (res.error) {
@@ -132,7 +136,8 @@ async function handleRefresh(): Promise<void> {
   setRefreshingSafe(true)
   set(actionErrorAtom, null)
   try {
-    const res = await plugin.request('workflows.refresh', undefined, { timeoutMs: 35_000 })
+    const orgId = read(snapshotAtom)?.selectedOrgId ?? read(selectedOrgAtom)
+    const res = await plugin.request('workflows.refresh', { orgId }, { timeoutMs: 35_000 })
     applySnapshotResponse(res)
   } catch (err) {
     set(actionErrorAtom, err instanceof Error ? err.message : 'Kunde inte uppdatera workflows.')
@@ -140,6 +145,20 @@ async function handleRefresh(): Promise<void> {
     if (read(refreshingAtom)) {
       setRefreshingSafe(false)
     }
+  }
+}
+
+async function handleSelectOrg(orgId: string): Promise<void> {
+  set(selectedOrgAtom, orgId)
+  set(selectedRepoAtom, 'all')
+  set(actionErrorAtom, null)
+  setRefreshingSafe(true)
+  try {
+    const res = await plugin.request('workflows.selectOrg', { orgId }, { timeoutMs: 35_000 })
+    applySnapshotResponse(res)
+  } catch (err) {
+    setRefreshingSafe(false)
+    set(actionErrorAtom, err instanceof Error ? err.message : 'Kunde inte byta organisation.')
   }
 }
 
@@ -297,7 +316,11 @@ function HeaderBar({ snapshot, refreshing }: { snapshot: WorkflowSnapshot | null
           ) : null}
         </Row>
         <Text muted size="xs">
-          {snapshot ? `${snapshot.counts.repos} öppna repon i Orca` : 'Läser öppna repon...'}
+          {snapshot
+            ? snapshot.selectedOrgId === 'open'
+              ? `${snapshot.counts.repos} öppna repon i Orca`
+              : `${snapshot.counts.repos} repon i ${snapshot.selectedOrgId}`
+            : 'Läser repon...'}
         </Text>
       </Stack>
       <Row gap="xs" align="center">
@@ -313,6 +336,26 @@ function HeaderBar({ snapshot, refreshing }: { snapshot: WorkflowSnapshot | null
         />
       </Row>
     </Row>
+  )
+}
+
+function OrgSelector({
+  orgs,
+  selectedOrgId
+}: {
+  orgs: WorkflowOrgOption[]
+  selectedOrgId: string
+}) {
+  if (orgs.length <= 1) return null
+
+  return (
+    <Select
+      label="Organisation"
+      labelHidden
+      value={selectedOrgId}
+      options={orgs.map((org) => ({ value: org.id, label: org.label }))}
+      onChange={handleSelectOrg}
+    />
   )
 }
 
@@ -557,7 +600,8 @@ function FailedRunsTab({ snapshot }: { snapshot: WorkflowSnapshot }) {
 }
 
 function AllRunsTab({ snapshot }: { snapshot: WorkflowSnapshot }) {
-  const selectedRepo = read(selectedRepoAtom)
+  const rawSelectedRepo = read(selectedRepoAtom)
+  const selectedRepo = snapshot.repos.some((r) => r.repoFullName === rawSelectedRepo) ? rawSelectedRepo : 'all'
   const statusFilter = read(statusFilterAtom)
   const onlyOpenBranches = read(onlyOpenBranchesAtom)
 
@@ -701,10 +745,13 @@ export default function Panel() {
   const refreshing = read(refreshingAtom)
   const activeTab = read(activeTabAtom)
   const actionError = read(actionErrorAtom)
+  const selectedOrgId = snapshot?.selectedOrgId ?? read(selectedOrgAtom)
+  const availableOrgs = snapshot?.availableOrgs ?? []
 
   return (
     <Stack gap="md">
       <HeaderBar snapshot={snapshot} refreshing={refreshing} />
+      <OrgSelector orgs={availableOrgs} selectedOrgId={selectedOrgId} />
 
       {actionError ? (
         <Callout tone="warning" icon="warning" title="Kunde inte hämta alla uppgifter">
@@ -784,7 +831,7 @@ export default function Panel() {
               Uppdaterad <RelativeTime at={snapshot.fetchedAt} format="short" muted />
             </Text>
             <Text muted size="xs">
-              {snapshot.counts.running + snapshot.counts.queued > 0 ? 'Pollar var 15:e sek' : 'Bakgrundspolling aktiv'}
+              {snapshot.counts.running + snapshot.counts.queued > 0 ? 'Pollar var 30:e sek' : 'Bakgrundspolling aktiv'}
             </Text>
           </Row>
         </>

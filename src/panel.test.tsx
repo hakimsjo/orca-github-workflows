@@ -189,3 +189,80 @@ test('panel accepts lower sequence numbers after workerId changes (worker restar
   assert.deepEqual(view.refusals, [])
   await view.unmount()
 })
+
+test('panel switches organization via workflows.selectOrg even with 0 open repos', async () => {
+  const now = Date.now()
+  const orgs = [
+    { id: 'open', label: 'Öppna repon i Orca', kind: 'open' as const },
+    { id: 'hakimsjo', label: 'hakimsjo (Personligt)', kind: 'personal' as const },
+    { id: 'systembydesign', label: 'Org: systembydesign', kind: 'organization' as const }
+  ]
+
+  const emptyOpenSnapshot = buildWorkflowSnapshot({
+    repoInputs: [],
+    focusedProjectId: null,
+    focusedBranch: null,
+    selectedOrgId: 'open',
+    availableOrgs: orgs,
+    authStatus: 'ok',
+    authError: null,
+    fetchedAt: now
+  })
+
+  const orgSnapshot = buildWorkflowSnapshot({
+    repoInputs: [
+      {
+        projectId: 'gh:systembydesign/qvitta',
+        projectName: 'qvitta',
+        repoFullName: 'systembydesign/qvitta',
+        path: '',
+        openBranches: [],
+        isFocused: false,
+        error: null,
+        rawRuns: [
+          {
+            id: 201,
+            name: 'CI',
+            run_number: 10,
+            status: 'in_progress',
+            conclusion: null,
+            head_branch: 'main',
+            created_at: new Date(now - 20_000).toISOString(),
+            updated_at: new Date(now - 10_000).toISOString()
+          }
+        ]
+      }
+    ],
+    focusedProjectId: null,
+    focusedBranch: null,
+    selectedOrgId: 'systembydesign',
+    availableOrgs: orgs,
+    authStatus: 'ok',
+    authError: null,
+    fetchedAt: now
+  })
+
+  const host = mockHost({
+    requests: {
+      'workflows.get': () => ({ snapshot: emptyOpenSnapshot, refreshing: false }),
+      'workflows.selectOrg': (input: { orgId: string }) => ({
+        snapshot: input.orgId === 'systembydesign' ? orgSnapshot : emptyOpenSnapshot,
+        refreshing: false
+      })
+    }
+  })
+
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ text: '0 öppna repon i Orca' }))
+
+  const orgSelect = view.find({ type: 'Select', label: 'Organisation' })
+  assert.ok(orgSelect)
+  await view.select(orgSelect, 'systembydesign')
+
+  assert.ok(view.find({ text: 'CI #10' }))
+  assert.ok(view.find({ text: '1 repon i systembydesign' }))
+
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.refusals, [])
+  await view.unmount()
+})

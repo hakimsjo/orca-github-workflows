@@ -2,6 +2,7 @@ import type {
   RepoSummary,
   WorkflowJob,
   WorkflowJobStep,
+  WorkflowOrgOption,
   WorkflowRun,
   WorkflowSnapshot,
   WorkflowStatusCategory
@@ -191,6 +192,8 @@ export function buildWorkflowSnapshot(params: {
   }[]
   focusedProjectId: string | null
   focusedBranch: string | null
+  selectedOrgId?: string
+  availableOrgs?: WorkflowOrgOption[]
   authStatus: 'ok' | 'unauthenticated' | 'missing_gh'
   authError: string | null
   fetchedAt?: number
@@ -270,6 +273,8 @@ export function buildWorkflowSnapshot(params: {
     runs: allRuns,
     focusedProjectId: params.focusedProjectId,
     focusedBranch: params.focusedBranch,
+    selectedOrgId: params.selectedOrgId ?? 'open',
+    availableOrgs: params.availableOrgs ?? [{ id: 'open', label: 'Öppna repon i Orca', kind: 'open' }],
     authStatus: params.authStatus,
     authError: params.authError,
     fetchedAt: params.fetchedAt ?? Date.now(),
@@ -281,4 +286,42 @@ export function isActiveOrFailingRun(run: WorkflowRun): boolean {
   if (run.category === 'running' || run.category === 'queued') return true
   if (run.category === 'failed' && run.isLatestForKey) return true
   return false
+}
+
+export function extractRepoOwner(repoFullName: string): string {
+  const slash = repoFullName.indexOf('/')
+  return slash > 0 ? repoFullName.slice(0, slash) : repoFullName
+}
+
+export function extractAvailableOwners(repos: readonly RepoSummary[]): string[] {
+  const seen = new Map<string, string>()
+  for (const repo of repos) {
+    const owner = extractRepoOwner(repo.repoFullName)
+    const key = owner.toLowerCase()
+    if (!seen.has(key)) {
+      seen.set(key, owner)
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.localeCompare(b, 'sv'))
+}
+
+export function filterSnapshotByOwner(snapshot: WorkflowSnapshot, selectedOrg: string): WorkflowSnapshot {
+  if (!selectedOrg || selectedOrg === 'all') return snapshot
+  const target = selectedOrg.toLowerCase()
+  const repos = snapshot.repos.filter((r) => extractRepoOwner(r.repoFullName).toLowerCase() === target)
+  const runs = snapshot.runs.filter((r) => extractRepoOwner(r.repoFullName).toLowerCase() === target)
+
+  return {
+    ...snapshot,
+    repos,
+    runs,
+    counts: {
+      repos: repos.length,
+      running: runs.filter((r) => r.category === 'running').length,
+      queued: runs.filter((r) => r.category === 'queued').length,
+      failed: runs.filter((r) => r.category === 'failed').length,
+      currentFailing: runs.filter((r) => r.category === 'failed' && r.isLatestForKey).length,
+      success: runs.filter((r) => r.category === 'success').length
+    }
+  }
 }

@@ -11,7 +11,7 @@ import {
   type RawWorkflowJob,
   type RawWorkflowRun
 } from './github'
-import type { SnapshotResponse, WorkflowJob, WorkflowSnapshot } from './protocol'
+import type { SnapshotResponse, WorkflowJob, WorkflowOrgOption, WorkflowSnapshot } from './protocol'
 
 const execFileAsync = promisify(execFile)
 
@@ -31,16 +31,21 @@ export function setExecForTests(fn: ExecFn | null): void {
 }
 
 const SNAPSHOT_STORAGE_KEY = 'workflows:snapshot'
-const DEFAULT_POLL_INTERVAL_SECONDS = 60
-const ACTIVE_POLL_INTERVAL_SECONDS = 15
-const STALE_AFTER_MS = 20_000
+const SELECTED_ORG_KEY = 'workflows:selectedOrg'
+const DEFAULT_POLL_INTERVAL_SECONDS = 120
+const ACTIVE_POLL_INTERVAL_SECONDS = 30
+const STALE_AFTER_MS = 60_000
+const ORGS_CACHE_TTL_MS = 15 * 60 * 1000
+const ORG_REPOS_CACHE_TTL_MS = 5 * 60 * 1000
 const REPO_FETCH_CONCURRENCY = 5
+const ORG_REPOS_LIMIT = 10
 const REFRESH_HARD_TIMEOUT_MS = 25_000
 const MIN_EVENT_REFRESH_GAP_MS = 10_000
 const RATE_LIMIT_BACKOFF_BASE_MS = 60_000
 const RATE_LIMIT_BACKOFF_MAX_MS = 8 * 60_000
 
 const REPO_NAME_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
+const OWNER_NAME_RE = /^[A-Za-z0-9_.-]+$/
 
 function resolveBinary(envVar: string, candidates: string[]): string {
   const fromEnv = process.env[envVar]
@@ -71,7 +76,7 @@ async function readSettings(orca: OrcaWorkerApi): Promise<PluginSettings> {
   try {
     const raw = await orca.settings.get()
     return {
-      pollIntervalSeconds: clampInt(raw.pollIntervalSeconds, DEFAULT_POLL_INTERVAL_SECONDS, 15, 600),
+      pollIntervalSeconds: clampInt(raw.pollIntervalSeconds, DEFAULT_POLL_INTERVAL_SECONDS, 30, 600),
       runsPerRepo: clampInt(raw.runsPerRepo, 10, 3, 25),
       includeHiddenProjects: raw.includeHiddenProjects === true
     }
@@ -84,9 +89,23 @@ async function readSettings(orca: OrcaWorkerApi): Promise<PluginSettings> {
   }
 }
 
-async function readCachedSnapshot(orca: OrcaWorkerApi): Promise<WorkflowSnapshot | null> {
+function snapshotKeyForOrg(orgId: string): string {
+  return orgId === 'open' ? SNAPSHOT_STORAGE_KEY : `${SNAPSHOT_STORAGE_KEY}:${orgId}`
+}
+
+async function readSelectedOrg(orca: OrcaWorkerApi): Promise<string> {
   try {
-    const stored = await orca.storage.get(SNAPSHOT_STORAGE_KEY)
+    const stored = await orca.storage.get(SELECTED_ORG_KEY)
+    if (typeof stored === 'string' && stored.length > 0) return stored
+  } catch {
+    // Ignore unreadable storage
+  }
+  return 'open'
+}
+
+async function readCachedSnapshot(orca: OrcaWorkerApi, orgId = 'open'): Promise<WorkflowSnapshot | null> {
+  try {
+    const stored = await orca.storage.get(snapshotKeyForOrg(orgId))
     if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
       return stored as unknown as WorkflowSnapshot
     }
@@ -181,7 +200,7 @@ export function classifyGhError(err: unknown): { kind: GhErrorKind; message: str
   ) {
     return {
       kind: 'rate_limited',
-      message: 'GitHub begränsar antalet anrop (rate limit).'
+      message: 'GitHub API-kvoten är tillfälligt slut (rate limit).'
     }
   }
   if (
@@ -234,10 +253,123 @@ async function resolveGitHubRepoForPath(repoPath: string): Promise<string | null
   }
 }
 
+async function fetchAvailableOrgs(): Promise<{
+  orgs: WorkflowOrgOption[]
+  personalLogin: string | null
+  authIssue?: 'missing_gh' | 'unauthenticated'
+  authMessage?: string
+}> {
+  const base: WorkflowOrgOption[] = [{ id: 'open', label: 'Öppna repon i Orca', kind: 'open' }]
+  try {
+    const [userRes, orgsRes] = await Promise.all([
+      exec(GH_BIN, ['api', '-i', 'user'], {
+        cwd: tmpdir(),
+        timeout: 8_000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 512 * 1024
+      }),
+      exec(GH_BIN, ['api', '-i', 'user/orgs?per_page=100'], {
+        cwd: tmpdir(),
+        timeout: 8_000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 1024 * 1024
+      }).catch((err) => {
+        if (classifyGhError(err).kind === 'rate_limited') {
+          const stdout = (err as { stdout?: string }).stdout
+          throw new RateLimitError(parseRetryAt(splitIncludeOutput(stdout ?? '').headers))
+        }
+        return { stdout: '[]', stderr: '' }
+      })
+    ])
+
+    const user = JSON.parse(splitIncludeOutput(userRes.stdout).body) as { login?: string }
+    const orgList = JSON.parse(splitIncludeOutput(orgsRes.stdout).body) as { login?: string }[]
+    const personalLogin = typeof user?.login === 'string' && user.login ? user.login : null
+
+    if (personalLogin) {
+      base.push({ id: personalLogin, label: `${personalLogin} (Personligt)`, kind: 'personal' })
+    }
+    if (Array.isArray(orgList)) {
+      const sorted = orgList
+        .map((o) => o?.login)
+        .filter((login): login is string => typeof login === 'string' && login.length > 0)
+        .sort((a, b) => a.localeCompare(b, 'sv'))
+      for (const login of sorted) {
+        base.push({ id: login, label: `Org: ${login}`, kind: 'organization' })
+      }
+    }
+    return { orgs: base, personalLogin }
+  } catch (err) {
+    if (err instanceof RateLimitError) throw err
+    const classified = classifyGhError(err)
+    if (classified.kind === 'rate_limited') {
+      const stdout = (err as { stdout?: string }).stdout
+      throw new RateLimitError(parseRetryAt(splitIncludeOutput(stdout ?? '').headers))
+    }
+    if (classified.kind === 'missing_gh' || classified.kind === 'unauthenticated') {
+      return {
+        orgs: base,
+        personalLogin: null,
+        authIssue: classified.kind,
+        authMessage: classified.message
+      }
+    }
+    return { orgs: base, personalLogin: null }
+  }
+}
+
+async function fetchReposForOwner(
+  owner: string,
+  isPersonal: boolean
+): Promise<{
+  repos: { name: string; fullName: string }[]
+  authIssue?: 'missing_gh' | 'unauthenticated'
+  authMessage?: string
+  error?: string
+}> {
+  if (!OWNER_NAME_RE.test(owner)) {
+    return { repos: [], error: 'Ogiltig organisation.' }
+  }
+  const endpoint = isPersonal
+    ? `user/repos?affiliation=owner&sort=pushed&per_page=${ORG_REPOS_LIMIT}`
+    : `orgs/${owner}/repos?sort=pushed&per_page=${ORG_REPOS_LIMIT}`
+  try {
+    const { stdout } = await exec(GH_BIN, ['api', '-i', endpoint], {
+      cwd: tmpdir(),
+      timeout: 10_000,
+      killSignal: 'SIGKILL',
+      maxBuffer: 4 * 1024 * 1024
+    })
+    const parsed = JSON.parse(splitIncludeOutput(stdout).body) as { name?: string; full_name?: string; archived?: boolean }[]
+    const repos = (Array.isArray(parsed) ? parsed : [])
+      .filter((r) => !r.archived && typeof r.full_name === 'string' && REPO_NAME_RE.test(r.full_name))
+      .map((r) => ({
+        name: typeof r.name === 'string' && r.name ? r.name : r.full_name!.split('/')[1],
+        fullName: r.full_name!
+      }))
+    return { repos }
+  } catch (err) {
+    const classified = classifyGhError(err)
+    if (classified.kind === 'rate_limited') {
+      const stdout = (err as { stdout?: string }).stdout
+      throw new RateLimitError(parseRetryAt(splitIncludeOutput(stdout ?? '').headers))
+    }
+    if (classified.kind === 'missing_gh' || classified.kind === 'unauthenticated') {
+      return { repos: [], authIssue: classified.kind, authMessage: classified.message }
+    }
+    return { repos: [], error: classified.message }
+  }
+}
+
 async function fetchRunsForRepo(
   repoFullName: string,
   runsPerRepo: number
-): Promise<{ runs: RawWorkflowRun[]; error: string | null; authIssue?: 'missing_gh' | 'unauthenticated'; authMessage?: string }> {
+): Promise<{
+  runs: RawWorkflowRun[]
+  error: string | null
+  authIssue?: 'missing_gh' | 'unauthenticated'
+  authMessage?: string
+}> {
   try {
     const { stdout } = await exec(
       GH_BIN,
@@ -338,7 +470,8 @@ export default function activate(orca: OrcaWorkerApi): void {
   let disposed = false
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
-  let inFlightRefresh: Promise<{ snapshot: WorkflowSnapshot; error: string | null }> | null = null
+  const inFlightByOrg = new Map<string, Promise<{ snapshot: WorkflowSnapshot; error: string | null }>>()
+  let activeOrgId = 'open'
   let lastSnapshot: WorkflowSnapshot | null = null
   let lastError: string | null = null
   let sequence = 0
@@ -346,6 +479,46 @@ export default function activate(orca: OrcaWorkerApi): void {
   let rateLimitStrikes = 0
   let lastRefreshStartedAt = 0
   const workerId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  let cachedOrgs: { orgs: WorkflowOrgOption[]; personalLogin: string | null; fetchedAt: number } | null = null
+  const cachedOrgRepos = new Map<string, { repos: { name: string; fullName: string }[]; fetchedAt: number }>()
+
+  async function getAvailableOrgsCached(): Promise<{
+    orgs: WorkflowOrgOption[]
+    personalLogin: string | null
+    authIssue?: 'missing_gh' | 'unauthenticated'
+    authMessage?: string
+    rateLimited?: boolean
+  }> {
+    if (cachedOrgs && Date.now() - cachedOrgs.fetchedAt < ORGS_CACHE_TTL_MS) {
+      return { orgs: cachedOrgs.orgs, personalLogin: cachedOrgs.personalLogin }
+    }
+    const res = await fetchAvailableOrgs()
+    if (!res.authIssue && res.orgs.length > 1) {
+      cachedOrgs = { orgs: res.orgs, personalLogin: res.personalLogin, fetchedAt: Date.now() }
+    }
+    return res
+  }
+
+  async function getReposForOwnerCached(
+    owner: string,
+    isPersonal: boolean
+  ): Promise<{
+    repos: { name: string; fullName: string }[]
+    authIssue?: 'missing_gh' | 'unauthenticated'
+    authMessage?: string
+    error?: string
+  }> {
+    const key = owner.toLowerCase()
+    const cached = cachedOrgRepos.get(key)
+    if (cached && Date.now() - cached.fetchedAt < ORG_REPOS_CACHE_TTL_MS) {
+      return { repos: cached.repos }
+    }
+    const res = await fetchReposForOwner(owner, isPersonal)
+    if (!res.authIssue && !res.error) {
+      cachedOrgRepos.set(key, { repos: res.repos, fetchedAt: Date.now() })
+    }
+    return res
+  }
 
   function nextSeq(): number {
     sequence += 1
@@ -411,11 +584,12 @@ export default function activate(orca: OrcaWorkerApi): void {
     return isPaused() ? rateLimitMessage() : null
   }
 
-  function emptySnapshot(): WorkflowSnapshot {
+  function emptySnapshot(selectedOrgId = 'open'): WorkflowSnapshot {
     return buildWorkflowSnapshot({
       repoInputs: [],
       focusedProjectId: null,
       focusedBranch: null,
+      selectedOrgId,
       authStatus: 'ok',
       authError: null
     })
@@ -434,9 +608,9 @@ export default function activate(orca: OrcaWorkerApi): void {
     debounceTimer.unref?.()
   }
 
-  async function collectSnapshot(): Promise<WorkflowSnapshot> {
+  async function collectSnapshot(selectedOrgId: string): Promise<WorkflowSnapshot> {
     const settings = await readSettings(orca)
-    const [projectsRes, workspacesRes, contextRes] = await Promise.all([
+    const [projectsRes, workspacesRes, contextRes, orgDiscovery] = await Promise.all([
       orca.host.call('project.list').catch((err) => {
         orca.log(`project.list failed: ${String(err)}`)
         return { projects: [], truncated: false }
@@ -445,7 +619,8 @@ export default function activate(orca: OrcaWorkerApi): void {
         orca.log(`workspace.list failed: ${String(err)}`)
         return { workspaces: [], truncated: false }
       }),
-      orca.host.call('workspace.readContext').catch(() => null)
+      orca.host.call('workspace.readContext').catch(() => null),
+      getAvailableOrgsCached()
     ])
 
     const workspaces = workspacesRes.workspaces ?? []
@@ -509,10 +684,44 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
     }
 
-    let authStatus: 'ok' | 'unauthenticated' | 'missing_gh' = 'ok'
-    let authError: string | null = null
+    let authStatus: 'ok' | 'unauthenticated' | 'missing_gh' = orgDiscovery.authIssue ?? 'ok'
+    let authError: string | null = orgDiscovery.authMessage ?? null
+    const availableOrgs = orgDiscovery.orgs
 
-    const repoTargets = Array.from(dedupedByFullName.values())
+    type RepoTarget = {
+      projectId: string
+      projectName: string
+      repoFullName: string
+      path: string
+      openBranches: Set<string>
+      isFocused: boolean
+    }
+
+    let repoTargets: RepoTarget[] = []
+    if (selectedOrgId === 'open') {
+      repoTargets = Array.from(dedupedByFullName.values())
+    } else if (authStatus === 'ok') {
+      const isPersonal = Boolean(orgDiscovery.personalLogin && selectedOrgId === orgDiscovery.personalLogin)
+      const orgRepos = await getReposForOwnerCached(selectedOrgId, isPersonal)
+      if (orgRepos.authIssue && authStatus === 'ok') {
+        authStatus = orgRepos.authIssue
+        authError = orgRepos.authMessage ?? null
+      } else if (orgRepos.error) {
+        throw new Error(orgRepos.error)
+      }
+      repoTargets = orgRepos.repos.map((r) => {
+        const openMatch = dedupedByFullName.get(r.fullName.toLowerCase())
+        return {
+          projectId: openMatch?.projectId ?? `gh:${r.fullName}`,
+          projectName: openMatch?.projectName ?? r.name,
+          repoFullName: r.fullName,
+          path: openMatch?.path ?? '',
+          openBranches: openMatch?.openBranches ?? new Set<string>(),
+          isFocused: openMatch?.isFocused ?? false
+        }
+      })
+    }
+
     let rateLimited = false
     const fetchedRepos = await mapWithConcurrency(repoTargets, REPO_FETCH_CONCURRENCY, async (target) => {
       // Stop issuing requests for the remaining repos once one hit the rate limit.
@@ -541,98 +750,117 @@ export default function activate(orca: OrcaWorkerApi): void {
       repoInputs: fetchedRepos,
       focusedProjectId,
       focusedBranch,
+      selectedOrgId,
+      availableOrgs,
       authStatus,
       authError
     })
   }
 
-  async function refreshSnapshot(): Promise<{ snapshot: WorkflowSnapshot; error: string | null }> {
-    if (inFlightRefresh) return inFlightRefresh
+  async function refreshSnapshot(orgIdOverride?: string): Promise<{ snapshot: WorkflowSnapshot; error: string | null }> {
+    const targetOrgId = orgIdOverride ?? activeOrgId
+    const existing = inFlightByOrg.get(targetOrgId)
+    if (existing) return existing
     if (isPaused()) {
       // Paused: serve the last good snapshot without touching GitHub.
-      const snapshot = lastSnapshot ?? (await readCachedSnapshot(orca)) ?? emptySnapshot()
+      const snapshot =
+        (lastSnapshot?.selectedOrgId === targetOrgId ? lastSnapshot : null) ??
+        (await readCachedSnapshot(orca, targetOrgId)) ??
+        emptySnapshot(targetOrgId)
       return { snapshot, error: lastError }
     }
     lastRefreshStartedAt = Date.now()
 
     const task = (async () => {
-      const cached = lastSnapshot ?? (await readCachedSnapshot(orca))
-      safePostUpdate({
-        refreshing: true,
-        workerId,
-        sequence: nextSeq(),
-        error: null
-      })
-
-      try {
-        const snapshot = await withTimeout(
-          collectSnapshot(),
-          REFRESH_HARD_TIMEOUT_MS,
-          'Hämtningen av workflows tog för lång tid. Försök igen.'
-        )
-
-        lastSnapshot = snapshot
-        lastError = null
-        rateLimitStrikes = 0
-        rateLimitedUntil = 0
-        await orca.storage.set(SNAPSHOT_STORAGE_KEY, snapshot as unknown as JsonValue).catch((err) => {
-          orca.log(`storage.set failed: ${String(err)}`)
-        })
-        await updateStatusBar(orca, snapshot)
+      const cached =
+        (lastSnapshot?.selectedOrgId === targetOrgId ? lastSnapshot : null) ??
+        (await readCachedSnapshot(orca, targetOrgId))
+      if (targetOrgId === activeOrgId) {
         safePostUpdate({
-          snapshot,
-          refreshing: false,
+          refreshing: true,
           workerId,
           sequence: nextSeq(),
           error: null
         })
-        await scheduleNextPoll(snapshot)
+      }
+
+      try {
+        const snapshot = await withTimeout(
+          collectSnapshot(targetOrgId),
+          REFRESH_HARD_TIMEOUT_MS,
+          'Hämtningen av workflows tog för lång tid. Försök igen.'
+        )
+
+        rateLimitStrikes = 0
+        rateLimitedUntil = 0
+        await orca.storage.set(snapshotKeyForOrg(targetOrgId), snapshot as unknown as JsonValue).catch((err) => {
+          orca.log(`storage.set failed: ${String(err)}`)
+        })
+        if (targetOrgId === activeOrgId) {
+          lastSnapshot = snapshot
+          lastError = null
+          await updateStatusBar(orca, snapshot)
+          safePostUpdate({
+            snapshot,
+            refreshing: false,
+            workerId,
+            sequence: nextSeq(),
+            error: null
+          })
+          await scheduleNextPoll(snapshot)
+        }
         return { snapshot, error: null }
       } catch (err) {
         let message = err instanceof Error ? err.message : String(err)
         if (err instanceof RateLimitError) {
           message = enterRateLimitPause(err.retryAt)
         }
-        orca.log(`Refresh failed: ${message}`)
-        lastError = message
-        const fallback = cached ?? emptySnapshot()
-        await updateStatusBar(orca, fallback)
-        safePostUpdate({
-          snapshot: fallback,
-          refreshing: false,
-          workerId,
-          sequence: nextSeq(),
-          error: message
-        })
-        await scheduleNextPoll(fallback)
+        orca.log(`Refresh failed (${targetOrgId}): ${message}`)
+        const fallback = cached ?? emptySnapshot(targetOrgId)
+        if (targetOrgId === activeOrgId) {
+          lastError = message
+          await updateStatusBar(orca, fallback)
+          safePostUpdate({
+            snapshot: fallback,
+            refreshing: false,
+            workerId,
+            sequence: nextSeq(),
+            error: message
+          })
+          await scheduleNextPoll(fallback)
+        }
         return { snapshot: fallback, error: message }
       } finally {
-        inFlightRefresh = null
+        inFlightByOrg.delete(targetOrgId)
       }
     })()
 
-    inFlightRefresh = task
+    inFlightByOrg.set(targetOrgId, task)
     return task
   }
 
   orca.panels.handle('workflows.get', async (): Promise<SnapshotResponse> => {
-    const cached = lastSnapshot ?? (await readCachedSnapshot(orca))
+    activeOrgId = await readSelectedOrg(orca)
+    const cached =
+      (lastSnapshot?.selectedOrgId === activeOrgId ? lastSnapshot : null) ??
+      (await readCachedSnapshot(orca, activeOrgId))
     if (cached) lastSnapshot = cached
     const isStale = !cached || Date.now() - cached.fetchedAt > STALE_AFTER_MS
-    if (isStale && !inFlightRefresh) {
-      void refreshSnapshot()
+    if (isStale && !isPaused() && !inFlightByOrg.has(activeOrgId)) {
+      void refreshSnapshot(activeOrgId)
     }
     return {
       snapshot: cached,
-      refreshing: Boolean(inFlightRefresh),
+      refreshing: !isPaused() && inFlightByOrg.has(activeOrgId),
       workerId,
       sequence,
       error: lastError
     }
   })
 
-  orca.panels.handle('workflows.refresh', async (): Promise<SnapshotResponse> => {
-    const { snapshot, error } = await refreshSnapshot()
+  orca.panels.handle('workflows.refresh', async (input): Promise<SnapshotResponse> => {
+    const orgId = input?.orgId ?? activeOrgId
+    const { snapshot, error } = await refreshSnapshot(orgId)
     return {
       snapshot,
       refreshing: false,
@@ -640,6 +868,30 @@ export default function activate(orca: OrcaWorkerApi): void {
       sequence,
       error
     }
+  })
+
+  orca.panels.handle('workflows.selectOrg', async ({ orgId }): Promise<SnapshotResponse> => {
+    const nextOrgId = typeof orgId === 'string' && orgId.length > 0 ? orgId : 'open'
+    activeOrgId = nextOrgId
+    await orca.storage.set(SELECTED_ORG_KEY, nextOrgId)
+    const cached = await readCachedSnapshot(orca, nextOrgId)
+    if (cached) {
+      lastSnapshot = cached
+      await updateStatusBar(orca, cached)
+    }
+    const isStale = !cached || Date.now() - cached.fetchedAt > STALE_AFTER_MS
+    if (isStale && !isPaused() && !inFlightByOrg.has(nextOrgId)) {
+      void refreshSnapshot(nextOrgId)
+    }
+    const response: SnapshotResponse = {
+      snapshot: cached,
+      refreshing: inFlightByOrg.has(nextOrgId) || (isStale && !isPaused()),
+      workerId,
+      sequence: nextSeq(),
+      error: isPaused() ? lastError : null
+    }
+    safePostUpdate(response)
+    return response
   })
 
   orca.panels.handle('workflows.jobs', async ({ repoFullName, runId }): Promise<{ jobs: WorkflowJob[]; error?: string | null }> => {
@@ -732,7 +984,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       lastSnapshot = { ...lastSnapshot, focusedBranch: nextBranch }
       safePostUpdate({
         snapshot: lastSnapshot,
-        refreshing: Boolean(inFlightRefresh),
+        refreshing: inFlightByOrg.has(activeOrgId),
         workerId,
         sequence: nextSeq(),
         error: lastError
@@ -753,7 +1005,8 @@ export default function activate(orca: OrcaWorkerApi): void {
   }
 
   void (async () => {
-    const cached = await readCachedSnapshot(orca)
+    activeOrgId = await readSelectedOrg(orca)
+    const cached = await readCachedSnapshot(orca, activeOrgId)
     if (disposed) return
     if (cached) {
       lastSnapshot = cached
@@ -762,7 +1015,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     const isStale = !cached || Date.now() - cached.fetchedAt > STALE_AFTER_MS
     if (isStale) {
       pollTimer = setTimeout(() => {
-        void refreshSnapshot()
+        void refreshSnapshot(activeOrgId)
       }, 250)
       pollTimer.unref?.()
     } else {

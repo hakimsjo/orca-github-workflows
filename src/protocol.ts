@@ -50,11 +50,19 @@ export interface WorkflowCounts {
   success: number
 }
 
+export interface WorkflowOrgOption {
+  id: string
+  label: string
+  kind: 'open' | 'personal' | 'organization'
+}
+
 export interface WorkflowSnapshot {
   repos: RepoSummary[]
   runs: WorkflowRun[]
   focusedProjectId: string | null
   focusedBranch: string | null
+  selectedOrgId: string
+  availableOrgs: WorkflowOrgOption[]
   authStatus: 'ok' | 'unauthenticated' | 'missing_gh'
   authError: string | null
   fetchedAt: number
@@ -92,7 +100,8 @@ export interface SnapshotResponse {
 declare module 'orca' {
   interface PluginRequests {
     'workflows.get': { output: SnapshotResponse }
-    'workflows.refresh': { output: SnapshotResponse }
+    'workflows.refresh': { input?: { orgId?: string }; output: SnapshotResponse }
+    'workflows.selectOrg': { input: { orgId: string }; output: SnapshotResponse }
     'workflows.jobs': {
       input: { repoFullName: string; runId: number }
       output: { jobs: WorkflowJob[]; error?: string | null }

@@ -380,7 +380,8 @@ test('rate limit pauses polling, keeps the last good snapshot and blocks all Git
   const worker = await mountWorker(main, { host })
   try {
     const first = await worker.request('workflows.refresh')
-    assert.equal(ghCalls.length, 1)
+    const callsAfterFirst = ghCalls.length
+    assert.ok(callsAfterFirst >= 1)
     assert.match(first.error ?? '', /GitHub begränsar anrop, försöker igen kl\. \d\d:\d\d/)
     assert.equal(first.snapshot?.runs.length, 3, 'last good snapshot is kept')
     assert.equal(first.snapshot?.repos[0].error, null, 'no red per-repo error')
@@ -406,7 +407,7 @@ test('rate limit pauses polling, keeps the last good snapshot and blocks all Git
     assert.match(cancel.error ?? '', /GitHub begränsar anrop/)
 
     await wait(800)
-    assert.equal(ghCalls.length, 1, 'no gh calls while paused')
+    assert.equal(ghCalls.length, callsAfterFirst, 'no gh calls while paused')
   } finally {
     await worker.deactivate()
     setExecForTests(null)
@@ -435,20 +436,30 @@ test('event-triggered refreshes are throttled to one per 10 s', async () => {
   try {
     const res = await worker.request('workflows.refresh')
     assert.equal(res.error, null)
-    assert.equal(ghCalls.length, 1)
+    const runCalls = () => ghCalls.filter((args) => args.some((a) => a.includes('/actions/runs')))
+    assert.equal(runCalls().length, 1)
     assert.deepEqual(ghCalls[0].slice(0, 2), ['api', '-i'])
+    const callsBeforeEvents = ghCalls.length
 
     // Without throttling these would refresh after their 600 ms debounce.
     await worker.emit('workspace.created', { workspaceId: 'w2', kind: 'worktree', path: '/', branch: 'feat' })
     await worker.emit('workspace.removed', { workspaceId: 'w2', kind: 'worktree', path: '/' })
     await wait(900)
-    assert.equal(ghCalls.length, 1, 'event refresh deferred by the throttle')
+    assert.equal(ghCalls.length, callsBeforeEvents, 'event refresh deferred by the throttle')
 
     // An explicit refresh from the panel is not throttled.
     await worker.request('workflows.refresh')
-    assert.equal(ghCalls.length, 2)
+    assert.equal(runCalls().length, 2)
   } finally {
     await worker.deactivate()
     setExecForTests(null)
   }
+})
+
+test('classifyGhError detects GitHub API rate limit errors', () => {
+  const res = main.classifyGhError({
+    stderr: 'gh: API rate limit exceeded for user ID 8287550 (HTTP 403)'
+  })
+  assert.equal(res.kind, 'rate_limited')
+  assert.match(res.message, /API-kvoten/)
 })
