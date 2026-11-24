@@ -15,17 +15,34 @@ import type { SnapshotResponse, WorkflowJob, WorkflowOrgOption, WorkflowSnapshot
 
 const execFileAsync = promisify(execFile)
 
+type ExecOptions = { cwd: string; timeout: number; killSignal: 'SIGKILL'; maxBuffer?: number }
+type ExecFn = (file: string, args: string[], options: ExecOptions) => Promise<{ stdout: string; stderr: string }>
+
+const defaultExec: ExecFn = async (file, args, options) => {
+  const { stdout, stderr } = await execFileAsync(file, args, { ...options, encoding: 'utf8' })
+  return { stdout, stderr }
+}
+
+let exec: ExecFn = defaultExec
+
+/** Test seam: replaces how the worker runs `gh` and `git`. Pass null to restore the default. */
+export function setExecForTests(fn: ExecFn | null): void {
+  exec = fn ?? defaultExec
+}
+
 const SNAPSHOT_STORAGE_KEY = 'workflows:snapshot'
 const SELECTED_ORG_KEY = 'workflows:selectedOrg'
 const DEFAULT_POLL_INTERVAL_SECONDS = 120
 const ACTIVE_POLL_INTERVAL_SECONDS = 30
-const RATE_LIMIT_BACKOFF_SECONDS = 300
 const STALE_AFTER_MS = 60_000
 const ORGS_CACHE_TTL_MS = 15 * 60 * 1000
 const ORG_REPOS_CACHE_TTL_MS = 5 * 60 * 1000
 const REPO_FETCH_CONCURRENCY = 5
 const ORG_REPOS_LIMIT = 10
 const REFRESH_HARD_TIMEOUT_MS = 25_000
+const MIN_EVENT_REFRESH_GAP_MS = 10_000
+const RATE_LIMIT_BACKOFF_BASE_MS = 60_000
+const RATE_LIMIT_BACKOFF_MAX_MS = 8 * 60_000
 
 const REPO_NAME_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const OWNER_NAME_RE = /^[A-Za-z0-9_.-]+$/
@@ -119,10 +136,47 @@ async function mapWithConcurrency<T, R>(
   return results
 }
 
-export function classifyGhError(err: unknown): {
-  kind: 'missing_gh' | 'unauthenticated' | 'rate_limited' | 'timeout' | 'other'
-  message: string
-} {
+type GhErrorKind = 'missing_gh' | 'unauthenticated' | 'timeout' | 'rate_limited' | 'other'
+
+export class RateLimitError extends Error {
+  readonly retryAt: number | null
+  constructor(retryAt: number | null) {
+    super('GitHub rate limit')
+    this.retryAt = retryAt
+  }
+}
+
+/** Parses `gh api -i` header block. Returns epoch ms when GitHub says we may retry, or null. */
+export function parseRetryAt(headerText: string | undefined, now = Date.now()): number | null {
+  if (!headerText) return null
+  const headers = new Map<string, string>()
+  for (const line of headerText.split(/\r?\n/)) {
+    const idx = line.indexOf(':')
+    if (idx > 0) headers.set(line.slice(0, idx).trim().toLowerCase(), line.slice(idx + 1).trim())
+  }
+  const retryAfter = Number(headers.get('retry-after'))
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return now + retryAfter * 1000
+  const reset = Number(headers.get('x-ratelimit-reset'))
+  if (headers.get('x-ratelimit-remaining') === '0' && Number.isFinite(reset) && reset > 0) return reset * 1000
+  return null
+}
+
+/**
+ * When the pause after a rate limit ends: GitHub's own retry time when it gave one, otherwise
+ * exponential backoff (1, 2, 4, 8 min, then 8 min) from the number of earlier consecutive hits.
+ */
+export function computeRateLimitPauseUntil(strikes: number, retryAt: number | null, now = Date.now()): number {
+  if (retryAt !== null && retryAt > now) return retryAt
+  return now + Math.min(RATE_LIMIT_BACKOFF_BASE_MS * 2 ** strikes, RATE_LIMIT_BACKOFF_MAX_MS)
+}
+
+export function splitIncludeOutput(stdout: string): { headers: string; body: string } {
+  const match = stdout.match(/\r?\n\r?\n/)
+  if (!stdout.startsWith('HTTP/') || !match || match.index === undefined) return { headers: '', body: stdout }
+  return { headers: stdout.slice(0, match.index), body: stdout.slice(match.index + match[0].length) }
+}
+
+export function classifyGhError(err: unknown): { kind: GhErrorKind; message: string } {
   const e = err as { code?: string | number; killed?: boolean; signal?: string; stderr?: string; message?: string }
   if (e.code === 'ENOENT') {
     return {
@@ -138,10 +192,15 @@ export function classifyGhError(err: unknown): {
   }
   const detail = `${e.stderr ?? ''}\n${e.message ?? ''}`.trim()
   const lower = detail.toLowerCase()
-  if (lower.includes('api rate limit exceeded') || lower.includes('secondary rate limit') || lower.includes('http 429')) {
+  if (
+    lower.includes('rate limit') ||
+    lower.includes('http 429') ||
+    lower.includes('too many requests') ||
+    lower.includes('abuse')
+  ) {
     return {
       kind: 'rate_limited',
-      message: 'GitHub API-kvoten är tillfälligt slut. Pausar automatisk uppdatering i 5 minuter.'
+      message: 'GitHub API-kvoten är tillfälligt slut (rate limit).'
     }
   }
   if (
@@ -182,7 +241,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 async function resolveGitHubRepoForPath(repoPath: string): Promise<string | null> {
   if (!repoPath || !existsSync(repoPath)) return null
   try {
-    const { stdout } = await execFileAsync(GIT_BIN, ['-C', repoPath, 'remote', '-v'], {
+    const { stdout } = await exec(GIT_BIN, ['-C', repoPath, 'remote', '-v'], {
       cwd: tmpdir(),
       timeout: 4_000,
       killSignal: 'SIGKILL',
@@ -203,22 +262,28 @@ async function fetchAvailableOrgs(): Promise<{
   const base: WorkflowOrgOption[] = [{ id: 'open', label: 'Öppna repon i Orca', kind: 'open' }]
   try {
     const [userRes, orgsRes] = await Promise.all([
-      execFileAsync(GH_BIN, ['api', 'user'], {
+      exec(GH_BIN, ['api', '-i', 'user'], {
         cwd: tmpdir(),
         timeout: 8_000,
         killSignal: 'SIGKILL',
         maxBuffer: 512 * 1024
       }),
-      execFileAsync(GH_BIN, ['api', 'user/orgs?per_page=100'], {
+      exec(GH_BIN, ['api', '-i', 'user/orgs?per_page=100'], {
         cwd: tmpdir(),
         timeout: 8_000,
         killSignal: 'SIGKILL',
         maxBuffer: 1024 * 1024
-      }).catch(() => ({ stdout: '[]' }))
+      }).catch((err) => {
+        if (classifyGhError(err).kind === 'rate_limited') {
+          const stdout = (err as { stdout?: string }).stdout
+          throw new RateLimitError(parseRetryAt(splitIncludeOutput(stdout ?? '').headers))
+        }
+        return { stdout: '[]', stderr: '' }
+      })
     ])
 
-    const user = JSON.parse(userRes.stdout) as { login?: string }
-    const orgList = JSON.parse(orgsRes.stdout) as { login?: string }[]
+    const user = JSON.parse(splitIncludeOutput(userRes.stdout).body) as { login?: string }
+    const orgList = JSON.parse(splitIncludeOutput(orgsRes.stdout).body) as { login?: string }[]
     const personalLogin = typeof user?.login === 'string' && user.login ? user.login : null
 
     if (personalLogin) {
@@ -235,7 +300,12 @@ async function fetchAvailableOrgs(): Promise<{
     }
     return { orgs: base, personalLogin }
   } catch (err) {
+    if (err instanceof RateLimitError) throw err
     const classified = classifyGhError(err)
+    if (classified.kind === 'rate_limited') {
+      const stdout = (err as { stdout?: string }).stdout
+      throw new RateLimitError(parseRetryAt(splitIncludeOutput(stdout ?? '').headers))
+    }
     if (classified.kind === 'missing_gh' || classified.kind === 'unauthenticated') {
       return {
         orgs: base,
@@ -264,13 +334,13 @@ async function fetchReposForOwner(
     ? `user/repos?affiliation=owner&sort=pushed&per_page=${ORG_REPOS_LIMIT}`
     : `orgs/${owner}/repos?sort=pushed&per_page=${ORG_REPOS_LIMIT}`
   try {
-    const { stdout } = await execFileAsync(GH_BIN, ['api', endpoint], {
+    const { stdout } = await exec(GH_BIN, ['api', '-i', endpoint], {
       cwd: tmpdir(),
       timeout: 10_000,
       killSignal: 'SIGKILL',
       maxBuffer: 4 * 1024 * 1024
     })
-    const parsed = JSON.parse(stdout) as { name?: string; full_name?: string; archived?: boolean }[]
+    const parsed = JSON.parse(splitIncludeOutput(stdout).body) as { name?: string; full_name?: string; archived?: boolean }[]
     const repos = (Array.isArray(parsed) ? parsed : [])
       .filter((r) => !r.archived && typeof r.full_name === 'string' && REPO_NAME_RE.test(r.full_name))
       .map((r) => ({
@@ -280,6 +350,10 @@ async function fetchReposForOwner(
     return { repos }
   } catch (err) {
     const classified = classifyGhError(err)
+    if (classified.kind === 'rate_limited') {
+      const stdout = (err as { stdout?: string }).stdout
+      throw new RateLimitError(parseRetryAt(splitIncludeOutput(stdout ?? '').headers))
+    }
     if (classified.kind === 'missing_gh' || classified.kind === 'unauthenticated') {
       return { repos: [], authIssue: classified.kind, authMessage: classified.message }
     }
@@ -295,12 +369,12 @@ async function fetchRunsForRepo(
   error: string | null
   authIssue?: 'missing_gh' | 'unauthenticated'
   authMessage?: string
-  rateLimited?: boolean
 }> {
   try {
-    const { stdout } = await execFileAsync(
+    const { stdout } = await exec(
       GH_BIN,
-      ['api', `repos/${repoFullName}/actions/runs?per_page=${runsPerRepo}`],
+      // -i so that rate-limit headers (retry-after, x-ratelimit-*) are visible on failure
+      ['api', '-i', `repos/${repoFullName}/actions/runs?per_page=${runsPerRepo}`],
       {
         cwd: tmpdir(),
         timeout: 10_000,
@@ -308,13 +382,17 @@ async function fetchRunsForRepo(
         maxBuffer: 4 * 1024 * 1024
       }
     )
-    const parsed = JSON.parse(stdout) as { workflow_runs?: RawWorkflowRun[] }
+    const parsed = JSON.parse(splitIncludeOutput(stdout).body) as { workflow_runs?: RawWorkflowRun[] }
     return {
       runs: Array.isArray(parsed.workflow_runs) ? parsed.workflow_runs : [],
       error: null
     }
   } catch (err) {
     const classified = classifyGhError(err)
+    if (classified.kind === 'rate_limited') {
+      const stdout = (err as { stdout?: string }).stdout
+      throw new RateLimitError(parseRetryAt(splitIncludeOutput(stdout ?? '').headers))
+    }
     if (classified.kind === 'missing_gh' || classified.kind === 'unauthenticated') {
       return {
         runs: [],
@@ -325,8 +403,7 @@ async function fetchRunsForRepo(
     }
     return {
       runs: [],
-      error: classified.message,
-      rateLimited: classified.kind === 'rate_limited'
+      error: classified.message
     }
   }
 }
@@ -398,6 +475,9 @@ export default function activate(orca: OrcaWorkerApi): void {
   let lastSnapshot: WorkflowSnapshot | null = null
   let lastError: string | null = null
   let sequence = 0
+  let rateLimitedUntil = 0
+  let rateLimitStrikes = 0
+  let lastRefreshStartedAt = 0
   const workerId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   let cachedOrgs: { orgs: WorkflowOrgOption[]; personalLogin: string | null; fetchedAt: number } | null = null
   const cachedOrgRepos = new Map<string, { repos: { name: string; fullName: string }[]; fetchedAt: number }>()
@@ -464,28 +544,63 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
   }
 
-  async function scheduleNextPoll(snapshot: WorkflowSnapshot | null, rateLimited = false): Promise<void> {
+  async function scheduleNextPoll(snapshot: WorkflowSnapshot | null): Promise<void> {
     if (disposed) return
     if (pollTimer) clearTimeout(pollTimer)
     const settings = await readSettings(orca)
     if (disposed) return
 
     const hasActive = Boolean(snapshot && snapshot.counts.running + snapshot.counts.queued > 0)
-    const intervalSec = rateLimited
-      ? RATE_LIMIT_BACKOFF_SECONDS
-      : hasActive
-        ? Math.min(settings.pollIntervalSeconds, ACTIVE_POLL_INTERVAL_SECONDS)
-        : settings.pollIntervalSeconds
+    const intervalSec = hasActive
+      ? Math.min(settings.pollIntervalSeconds, ACTIVE_POLL_INTERVAL_SECONDS)
+      : settings.pollIntervalSeconds
 
+    const delayMs = Math.max(intervalSec * 1000, rateLimitedUntil - Date.now())
     pollTimer = setTimeout(() => {
       void refreshSnapshot()
-    }, intervalSec * 1000)
+    }, delayMs)
     pollTimer.unref?.()
+  }
+
+  function rateLimitMessage(): string {
+    const hhmm = new Date(rateLimitedUntil).toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })
+    return `GitHub begränsar anrop, försöker igen kl. ${hhmm}.`
+  }
+
+  /** Starts (or extends) the pause after GitHub rate-limited us and returns the message to show. */
+  function enterRateLimitPause(retryAt: number | null): string {
+    rateLimitedUntil = Math.max(rateLimitedUntil, computeRateLimitPauseUntil(rateLimitStrikes, retryAt))
+    rateLimitStrikes += 1
+    lastError = rateLimitMessage()
+    return lastError
+  }
+
+  function isPaused(): boolean {
+    return Date.now() < rateLimitedUntil
+  }
+
+  /** For panel actions that call GitHub: the pause message while paused, else null. */
+  function pausedError(): string | null {
+    return isPaused() ? rateLimitMessage() : null
+  }
+
+  function emptySnapshot(selectedOrgId = 'open'): WorkflowSnapshot {
+    return buildWorkflowSnapshot({
+      repoInputs: [],
+      focusedProjectId: null,
+      focusedBranch: null,
+      selectedOrgId,
+      authStatus: 'ok',
+      authError: null
+    })
   }
 
   function scheduleDebouncedRefresh(delayMs = 500): void {
     if (disposed) return
     if (debounceTimer) clearTimeout(debounceTimer)
+    // Event-triggered refreshes never fire closer than MIN_EVENT_REFRESH_GAP_MS apart, nor during a rate limit.
+    const earliest = Math.max(lastRefreshStartedAt + MIN_EVENT_REFRESH_GAP_MS, rateLimitedUntil)
+    delayMs = Math.max(delayMs, earliest - Date.now())
     debounceTimer = setTimeout(() => {
       debounceTimer = null
       void refreshSnapshot()
@@ -609,10 +724,12 @@ export default function activate(orca: OrcaWorkerApi): void {
 
     let rateLimited = false
     const fetchedRepos = await mapWithConcurrency(repoTargets, REPO_FETCH_CONCURRENCY, async (target) => {
-      const fetched = await fetchRunsForRepo(target.repoFullName, settings.runsPerRepo)
-      if (fetched.rateLimited) {
-        rateLimited = true
-      }
+      // Stop issuing requests for the remaining repos once one hit the rate limit.
+      if (rateLimited) throw new RateLimitError(null)
+      const fetched = await fetchRunsForRepo(target.repoFullName, settings.runsPerRepo).catch((err) => {
+        if (err instanceof RateLimitError) rateLimited = true
+        throw err
+      })
       if (fetched.authIssue && authStatus === 'ok') {
         authStatus = fetched.authIssue
         authError = fetched.authMessage ?? fetched.error
@@ -629,10 +746,6 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
     })
 
-    if (rateLimited) {
-      throw new Error('GitHub API-kvoten är tillfälligt slut. Pausar automatisk uppdatering i 5 minuter.')
-    }
-
     return buildWorkflowSnapshot({
       repoInputs: fetchedRepos,
       focusedProjectId,
@@ -648,6 +761,15 @@ export default function activate(orca: OrcaWorkerApi): void {
     const targetOrgId = orgIdOverride ?? activeOrgId
     const existing = inFlightByOrg.get(targetOrgId)
     if (existing) return existing
+    if (isPaused()) {
+      // Paused: serve the last good snapshot without touching GitHub.
+      const snapshot =
+        (lastSnapshot?.selectedOrgId === targetOrgId ? lastSnapshot : null) ??
+        (await readCachedSnapshot(orca, targetOrgId)) ??
+        emptySnapshot(targetOrgId)
+      return { snapshot, error: lastError }
+    }
+    lastRefreshStartedAt = Date.now()
 
     const task = (async () => {
       const cached =
@@ -669,6 +791,8 @@ export default function activate(orca: OrcaWorkerApi): void {
           'Hämtningen av workflows tog för lång tid. Försök igen.'
         )
 
+        rateLimitStrikes = 0
+        rateLimitedUntil = 0
         await orca.storage.set(snapshotKeyForOrg(targetOrgId), snapshot as unknown as JsonValue).catch((err) => {
           orca.log(`storage.set failed: ${String(err)}`)
         })
@@ -687,18 +811,12 @@ export default function activate(orca: OrcaWorkerApi): void {
         }
         return { snapshot, error: null }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
+        let message = err instanceof Error ? err.message : String(err)
+        if (err instanceof RateLimitError) {
+          message = enterRateLimitPause(err.retryAt)
+        }
         orca.log(`Refresh failed (${targetOrgId}): ${message}`)
-        const fallback =
-          cached ??
-          buildWorkflowSnapshot({
-            repoInputs: [],
-            focusedProjectId: null,
-            focusedBranch: null,
-            selectedOrgId: targetOrgId,
-            authStatus: 'ok',
-            authError: null
-          })
+        const fallback = cached ?? emptySnapshot(targetOrgId)
         if (targetOrgId === activeOrgId) {
           lastError = message
           await updateStatusBar(orca, fallback)
@@ -709,9 +827,7 @@ export default function activate(orca: OrcaWorkerApi): void {
             sequence: nextSeq(),
             error: message
           })
-          const isRateLimited =
-            message.includes('API-kvoten') || message.toLowerCase().includes('rate limit')
-          await scheduleNextPoll(fallback, isRateLimited)
+          await scheduleNextPoll(fallback)
         }
         return { snapshot: fallback, error: message }
       } finally {
@@ -730,12 +846,12 @@ export default function activate(orca: OrcaWorkerApi): void {
       (await readCachedSnapshot(orca, activeOrgId))
     if (cached) lastSnapshot = cached
     const isStale = !cached || Date.now() - cached.fetchedAt > STALE_AFTER_MS
-    if (isStale && !inFlightByOrg.has(activeOrgId)) {
+    if (isStale && !isPaused() && !inFlightByOrg.has(activeOrgId)) {
       void refreshSnapshot(activeOrgId)
     }
     return {
       snapshot: cached,
-      refreshing: inFlightByOrg.has(activeOrgId),
+      refreshing: !isPaused() && inFlightByOrg.has(activeOrgId),
       workerId,
       sequence,
       error: lastError
@@ -764,15 +880,15 @@ export default function activate(orca: OrcaWorkerApi): void {
       await updateStatusBar(orca, cached)
     }
     const isStale = !cached || Date.now() - cached.fetchedAt > STALE_AFTER_MS
-    if (isStale && !inFlightByOrg.has(nextOrgId)) {
+    if (isStale && !isPaused() && !inFlightByOrg.has(nextOrgId)) {
       void refreshSnapshot(nextOrgId)
     }
     const response: SnapshotResponse = {
       snapshot: cached,
-      refreshing: inFlightByOrg.has(nextOrgId) || isStale,
+      refreshing: inFlightByOrg.has(nextOrgId) || (isStale && !isPaused()),
       workerId,
       sequence: nextSeq(),
-      error: null
+      error: isPaused() ? lastError : null
     }
     safePostUpdate(response)
     return response
@@ -782,10 +898,12 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (!REPO_NAME_RE.test(repoFullName) || !Number.isInteger(runId) || runId <= 0) {
       return { jobs: [], error: 'Ogiltigt repo eller runId.' }
     }
+    const paused = pausedError()
+    if (paused) return { jobs: [], error: paused }
     try {
-      const { stdout } = await execFileAsync(
+      const { stdout } = await exec(
         GH_BIN,
-        ['api', `repos/${repoFullName}/actions/runs/${runId}/jobs?per_page=50`],
+        ['api', '-i', `repos/${repoFullName}/actions/runs/${runId}/jobs?per_page=50`],
         {
           cwd: tmpdir(),
           timeout: 12_000,
@@ -793,11 +911,15 @@ export default function activate(orca: OrcaWorkerApi): void {
           maxBuffer: 4 * 1024 * 1024
         }
       )
-      const parsed = JSON.parse(stdout) as { jobs?: RawWorkflowJob[] }
+      const parsed = JSON.parse(splitIncludeOutput(stdout).body) as { jobs?: RawWorkflowJob[] }
       const jobs = normalizeWorkflowJobs(Array.isArray(parsed.jobs) ? parsed.jobs : [])
       return { jobs, error: null }
     } catch (err) {
-      const { message } = classifyGhError(err)
+      const classified = classifyGhError(err)
+      const message =
+        classified.kind === 'rate_limited'
+          ? enterRateLimitPause(parseRetryAt(splitIncludeOutput((err as { stdout?: string }).stdout ?? '').headers))
+          : classified.message
       orca.log(`workflows.jobs failed (${repoFullName}#${runId}): ${message}`)
       return { jobs: [], error: message }
     }
@@ -807,10 +929,12 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (!REPO_NAME_RE.test(repoFullName) || !Number.isInteger(runId) || runId <= 0) {
       return { ok: false, error: 'Ogiltigt repo eller runId.' }
     }
+    const paused = pausedError()
+    if (paused) return { ok: false, error: paused }
     try {
       const args = ['run', 'rerun', String(runId), '--repo', repoFullName]
       if (failedOnly) args.push('--failed')
-      await execFileAsync(GH_BIN, args, {
+      await exec(GH_BIN, args, {
         cwd: tmpdir(),
         timeout: 12_000,
         killSignal: 'SIGKILL'
@@ -818,7 +942,8 @@ export default function activate(orca: OrcaWorkerApi): void {
       scheduleDebouncedRefresh(1200)
       return { ok: true }
     } catch (err) {
-      const { message } = classifyGhError(err)
+      const classified = classifyGhError(err)
+      const message = classified.kind === 'rate_limited' ? enterRateLimitPause(null) : classified.message
       orca.log(`workflows.rerun failed (${repoFullName}#${runId}): ${message}`)
       return { ok: false, error: message }
     }
@@ -828,8 +953,10 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (!REPO_NAME_RE.test(repoFullName) || !Number.isInteger(runId) || runId <= 0) {
       return { ok: false, error: 'Ogiltigt repo eller runId.' }
     }
+    const paused = pausedError()
+    if (paused) return { ok: false, error: paused }
     try {
-      await execFileAsync(GH_BIN, ['run', 'cancel', String(runId), '--repo', repoFullName], {
+      await exec(GH_BIN, ['run', 'cancel', String(runId), '--repo', repoFullName], {
         cwd: tmpdir(),
         timeout: 12_000,
         killSignal: 'SIGKILL'
@@ -837,7 +964,8 @@ export default function activate(orca: OrcaWorkerApi): void {
       scheduleDebouncedRefresh(1200)
       return { ok: true }
     } catch (err) {
-      const { message } = classifyGhError(err)
+      const classified = classifyGhError(err)
+      const message = classified.kind === 'rate_limited' ? enterRateLimitPause(null) : classified.message
       orca.log(`workflows.cancel failed (${repoFullName}#${runId}): ${message}`)
       return { ok: false, error: message }
     }
